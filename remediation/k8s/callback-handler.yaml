@@ -1,0 +1,241 @@
+# Replaces the brief's callback-handler Deployment. Changes, by finding (SUBMISSION.md §2.1):
+#   - password in the manifest     -> External Secrets pulls it from AWS Secrets Manager
+#   - privileged, runs as root     -> non-root, no capabilities, read-only root filesystem
+#   - `default` service account    -> its own account, no Kubernetes API token mounted
+#   - `:latest` tag                -> ECR image pinned by digest (CI writes the digest)
+#   - 1 replica, no limits         -> 3 replicas across zones, requests/limits, probes, PDB
+#   - open network                 -> default-deny NetworkPolicies with named exceptions, and a
+#                                     security group that the wallet database admits
+#   - no selector/labels           -> added (apps/v1 rejects a Deployment without a selector)
+
+# --- Identity ----------------------------------------------------------------------------
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: callback-handler
+  namespace: callbacks
+# The app never calls the Kubernetes API, so it gets no token. Remote code execution in the
+# pod then yields no cluster credentials.
+automountServiceAccountToken: false
+---
+# Used only by the External Secrets controller to read this namespace's secrets from AWS.
+# Its IRSA role may call secretsmanager:GetSecretValue on prod/callbacks/* and nothing else.
+# The app pods do not run as this account.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: callbacks-secrets-reader
+  namespace: callbacks
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<prod-account-id>:role/callbacks-secrets-reader
+automountServiceAccountToken: false
+---
+# --- Secrets ------------------------------------------------------------------------------
+
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: aws-secrets-manager
+  namespace: callbacks
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: eu-central-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: callbacks-secrets-reader
+---
+# The password that was in the manifest is treated as leaked. It was rotated before this
+# change, and the new value exists only in Secrets Manager.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: callback-handler-db
+  namespace: callbacks
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: aws-secrets-manager
+  target:
+    name: callback-handler-db
+    creationPolicy: Owner
+  data:
+    - secretKey: password
+      remoteRef:
+        key: prod/callbacks/callback-handler-db
+        property: password
+---
+# --- Workload -----------------------------------------------------------------------------
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: callback-handler
+  namespace: callbacks
+  labels:
+    app.kubernetes.io/name: callback-handler
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: callback-handler
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: callback-handler
+    spec:
+      serviceAccountName: callback-handler
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: callback-handler
+      containers:
+        - name: app
+          # CI sets the digest. Kyverno rejects a tag-only reference or an unsigned digest.
+          image: <prod-account-id>.dkr.ecr.eu-central-1.amazonaws.com/callback-handler@sha256:<digest>
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            # Same variable name as before, so the app needs no code change. After the
+            # password rotates, a rolling restart picks up the new value.
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: callback-handler-db
+                  key: password
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Node.js needs a writable /tmp. The rest of the filesystem stays read-only.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+# Keeps two pods serving callbacks while nodes are drained or upgraded. Payment and game
+# providers retry failed callbacks, so idempotency in the handler still matters.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: callback-handler
+  namespace: callbacks
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: callback-handler
+---
+# --- Network ------------------------------------------------------------------------------
+# Needs a CNI that enforces NetworkPolicy (the VPC CNI with network policy enabled, or Cilium).
+# Rollout: map the real traffic flows in staging first; a missing rule here is an outage.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: callbacks
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: callback-handler
+  namespace: callbacks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: callback-handler
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # From the load balancer only (AWS Load Balancer Controller in IP mode: traffic comes from
+    # the load balancer's addresses in the public subnets).
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/22 # <public subnets>
+      ports:
+        - port: 3000
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Today the handler writes to the wallet database itself, with its own database role (not
+    # the master user). Target design: it calls the wallet service, which owns the ledger, and
+    # this rule is replaced by one to that service.
+    - to:
+        - ipBlock:
+            cidr: 10.0.32.0/22 # <database subnets>
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+# The wallet database's security group admits only pods that carry the db-client security group
+# (terraform/rds-wallet.tf). EKS security groups for pods assign it here. The pod gets only the
+# listed groups, so the cluster's own security group must be listed too or it loses its other
+# traffic.
+apiVersion: vpcresources.k8s.aws/v1beta1
+kind: SecurityGroupPolicy
+metadata:
+  name: callback-handler-db-client
+  namespace: callbacks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: callback-handler
+  securityGroups:
+    groupIds:
+      - <cluster-security-group-id>
+      - <callback-handler-db-client-security-group-id>

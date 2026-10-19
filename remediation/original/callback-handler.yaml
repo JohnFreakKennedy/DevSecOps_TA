@@ -1,0 +1,21 @@
+# Brief Part 2B, as given. Kept for before/after comparison only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: callback-handler
+spec:
+  replicas: 1
+  template:
+    spec:
+      serviceAccountName: default
+      containers:
+        - name: app
+          image: registry.example.com/callback-handler:latest
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: DB_PASSWORD
+              value: "production-password"
+          ports:
+            - containerPort: 3000

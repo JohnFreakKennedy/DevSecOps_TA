@@ -1,0 +1,134 @@
+# Admission policies for the production cluster (Kyverno).
+#
+# - Each policy has its own validationFailureAction, so it moves from Audit to Enforce in its own
+#   week of the rollout (SUBMISSION.md §2.6). Kyverno 1.13+ prefers a per-rule failureAction
+#   field; the spec-level field still works.
+# - Scope: every namespace except the platform's system namespaces, so a new namespace is
+#   covered by default.
+# - Kyverno accepts PolicyExceptions only from its own namespace, which only Security and a named
+#   Platform deputy can write to (Helm value: exceptionNamespace).
+# - Availability: with Enforce, pods cannot start while Kyverno is down. It runs 3 replicas.
+---
+# 1. Pod Security "restricted" for every pod: no privileged containers, root, host namespaces or
+#    added capabilities. Audit in week 1, Enforce in week 4. Namespaces also carry the built-in
+#    Pod Security Admission labels (namespace.yaml); this policy covers namespaces that forget.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: pod-security-restricted
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: restricted
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "kyverno", "external-secrets"]
+      validate:
+        podSecurity:
+          level: restricted
+          version: latest
+---
+# 2. Images only from the production ECR registry, pinned by digest. Enforce in week 3.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: prod-registry-and-digest
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: prod-registry-and-digest
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "kyverno", "external-secrets"]
+      validate:
+        message: "Images must come from the production ECR registry and be pinned by digest (@sha256:...)."
+        pattern:
+          spec:
+            containers:
+              - image: "<prod-account-id>.dkr.ecr.eu-central-1.amazonaws.com/*@sha256:*"
+            =(initContainers):
+              - image: "<prod-account-id>.dkr.ecr.eu-central-1.amazonaws.com/*@sha256:*"
+            =(ephemeralContainers):
+              - image: "<prod-account-id>.dkr.ecr.eu-central-1.amazonaws.com/*@sha256:*"
+---
+# 3. Images signed with the production release key: built from main, scanned, approved.
+#    Enforce in weeks 5-6. Only the approved CI deploy job can use the signing key
+#    (terraform/image-signing.tf). The signatures sit in their own ECR repository; anyone who
+#    can write there can delete a signature, which blocks a deploy, but cannot forge one.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: prod-images-signed
+spec:
+  validationFailureAction: Audit
+  background: false
+  webhookTimeoutSeconds: 15
+  rules:
+    - name: signed-by-prod-release-key
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      exclude:
+        any:
+          - resources:
+              namespaces: ["kube-system", "kyverno", "external-secrets"]
+      verifyImages:
+        - imageReferences:
+            - "<prod-account-id>.dkr.ecr.eu-central-1.amazonaws.com/*"
+          repository: "<prod-account-id>.dkr.ecr.eu-central-1.amazonaws.com/image-signatures"
+          required: true
+          verifyDigest: true
+          mutateDigest: false
+          attestors:
+            - entries:
+                - keys:
+                    # Public half of alias/image-signing-prod:
+                    #   cosign public-key --key awskms:///alias/image-signing-prod
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      <public key>
+                      -----END PUBLIC KEY-----
+                    # Private images: signatures are not published to the public
+                    # transparency log, so Kyverno must not look for them there.
+                    rekor:
+                      ignoreTlog: true
+                    ctlog:
+                      ignoreSCT: true
+---
+# 4. The *-secrets-reader service accounts carry an IAM role that can read the namespace's
+#    secrets in AWS Secrets Manager (terraform/irsa-callbacks.tf). Only the External Secrets
+#    controller uses them, by requesting a token; it never runs a pod as them. Without this
+#    rule, anyone who can create a pod or change a pod template in the namespace could run a
+#    pod as that account and read the secrets. Enforced from day one: no legitimate pod uses
+#    these accounts, so nothing breaks.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-secrets-reader-accounts
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-pods-as-secrets-reader
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+      validate:
+        message: "*-secrets-reader service accounts are reserved for the External Secrets controller."
+        pattern:
+          spec:
+            =(serviceAccountName): "!*-secrets-reader"

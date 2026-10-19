@@ -1,0 +1,15 @@
+# The internet-facing callback handler gets its own namespace, separate from the wallet core.
+# A namespace is the boundary for secrets, RBAC and pod security. Sharing one with the ledger
+# means a compromised callback handler can reach the wallet's secrets (Part 3 timeline, 02:16).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: callbacks
+  labels:
+    # Pod Security Admission rejects privileged, root, host-namespace and capability-adding pods.
+    # Target state (week 4). In week 1 apply it without the `enforce` label: `warn` and `audit`
+    # show what would be rejected without rejecting it. Kyverno's pod-security-restricted
+    # policy covers every other namespace the same way.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

@@ -1,0 +1,6 @@
+# Exceptions to the dependency, IaC and image gates for this service. Rules: SUBMISSION.md §2.5.
+# Each entry: a comment line with ticket, owner, reason and severity, then the ID with an `exp:`
+# date. After that date Trivy stops ignoring it and the gate fails again.
+
+# SEC-142 | owner: @payments-tech-lead | not reachable: the vulnerable XML parser is never called | HIGH
+CVE-2026-00000 exp:2026-11-16

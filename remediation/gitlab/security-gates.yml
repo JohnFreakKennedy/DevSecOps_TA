@@ -1,0 +1,90 @@
+# Central security gates. Lives in platform/ci-templates (CODEOWNERS there: Platform and
+# Security). Service pipelines include it through the protected tag `v1`.
+#
+# Rollout (SUBMISSION.md §2.6): the secrets gate blocks from day one. The others start with
+# `allow_failure: true` (a finding shows as "failed (allowed)"), and Platform flips them in this
+# file, one gate at a time. Dependency and image gates block CRITICAL from week 3 and HIGH as
+# well from weeks 5-6. The IaC gate blocks HIGH and CRITICAL from week 3: Trivy rates few
+# misconfigurations CRITICAL, so CRITICAL alone would block almost nothing.
+# Exceptions (.trivyignore, .gitleaksignore): SUBMISSION.md §2.5. A nightly full-history secrets
+# scan of every repository runs from this project's own schedule (not part of this excerpt).
+
+variables:
+  GITLEAKS_IMAGE: ${CI_TOOLS_REGISTRY}/gitleaks@sha256:<digest>
+  TRIVY_IMAGE: ${CI_TOOLS_REGISTRY}/trivy@sha256:<digest>
+
+# Exchange the job's GitLab ID token for short-lived AWS credentials. The job sets AWS_ROLE_ARN
+# and declares an ID token named AWS_ID_TOKEN with that role's audience.
+.aws_role:
+  before_script:
+    - echo "$AWS_ID_TOKEN" > /tmp/aws-web-identity-token
+    - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/aws-web-identity-token
+    # Appears in CloudTrail: which job and which person caused each AWS call (max 64 chars).
+    - export AWS_ROLE_SESSION_NAME="$(echo "gl-${CI_JOB_ID}-${GITLAB_USER_LOGIN}" | cut -c1-64)"
+
+# --- Secrets: blocking from day one, on the merge request's new commits ---------------------
+
+secrets_scan:
+  stage: test
+  image:
+    name: $GITLEAKS_IMAGE
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: 0 # full history, so the merge-request commit range exists
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - gitleaks git --redact --no-banner --report-path gitleaks.json --log-opts="${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}" .
+  artifacts:
+    when: always
+    paths: [gitleaks.json]
+
+# --- Dependencies -----------------------------------------------------------------------------
+
+dependency_scan:
+  stage: test
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  allow_failure: true # false from week 3
+  script:
+    # Only vulnerabilities with a fixed version fail: those are the ones a developer can act on.
+    - trivy fs --scanners vuln --pkg-types library --severity CRITICAL --ignore-unfixed --exit-code 1 .
+
+# --- Infrastructure as code: Terraform, Kubernetes manifests, Dockerfile ----------------------
+
+iac_scan:
+  stage: test
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  allow_failure: true # false from week 3
+  script:
+    - trivy config --severity HIGH,CRITICAL --exit-code 1 .
+
+# --- Container image: extended by each service pipeline after its build job -------------------
+
+.container_scan:
+  stage: scan
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  extends: .aws_role
+  allow_failure: true # false from week 3
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  tags: [build] # the build role only works from the build runners' addresses
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: aws-prod-build
+  variables:
+    AWS_ROLE_ARN: arn:aws:iam::${PROD_AWS_ACCOUNT_ID}:role/gitlab-build-prod
+  script:
+    # The tag is immutable, so this scans exactly the image the deploy job will look up.
+    # SBOM first, so it exists even when the gate fails. It is kept as release evidence.
+    - trivy image --format cyclonedx --output sbom.cdx.json "$IMAGE:$IMAGE_TAG"
+    - trivy sbom --severity CRITICAL --ignore-unfixed --exit-code 1 sbom.cdx.json
+  artifacts:
+    when: always
+    paths: [sbom.cdx.json]
+    expire_in: 1 year
