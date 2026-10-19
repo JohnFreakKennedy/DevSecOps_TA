@@ -1,0 +1,40 @@
+# What the CI deploy role can do in the cluster. The EKS access entry in
+# terraform/eks-access.tf maps the gitlab-deploy-prod IAM role to the `ci-deployers` group.
+#
+# It can change the image of an existing Deployment and watch the rollout. Through the
+# Kubernetes API it cannot read secrets, exec into pods, create pods directly or touch other
+# namespaces, so Part 3's 02:16 secret reads and 02:18 pod creation are refused for it.
+#
+# Patching a Deployment still changes the pod template, and the ReplicaSet controller then
+# creates pods from it. Admission control is what limits those pods: Pod Security rejects
+# privileged ones, and Kyverno admits only digest-pinned images built from main and signed by
+# an approved deploy (kyverno-policies.yaml).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-deployer
+  namespace: callbacks
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch"] # set image, rollout undo
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"] # rollout status
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-deployer
+  namespace: callbacks
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ci-deployer
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: ci-deployers

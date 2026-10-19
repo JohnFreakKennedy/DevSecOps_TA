@@ -1,0 +1,102 @@
+# callback-handler pipeline. Replaces the brief's `build` and `deploy_prod` jobs.
+# Design notes: SUBMISSION.md §2.4. Security jobs come from the central template.
+
+include:
+  - project: platform/ci-templates
+    ref: v1 # protected tag that only Platform can move, so every service gets gate changes
+    file: security-gates.yml
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages: [test, build, scan, deploy]
+
+variables:
+  AWS_REGION: eu-central-1
+  ECR_REGISTRY: ${PROD_AWS_ACCOUNT_ID}.dkr.ecr.eu-central-1.amazonaws.com
+  IMAGE: ${ECR_REGISTRY}/callback-handler
+  # Immutable in ECR. Later jobs look the image up by this tag instead of trusting anything the
+  # build job wrote.
+  IMAGE_TAG: ${CI_COMMIT_SHA}-${CI_PIPELINE_ID}
+  # Tool images are built by Platform, mirrored to the tools registry and pinned by digest.
+  # Renovate opens a merge request when a new digest is published.
+  NODE_IMAGE: ${CI_TOOLS_REGISTRY}/node@sha256:<digest>         # node:22-alpine
+  BUILDER_IMAGE: ${CI_TOOLS_REGISTRY}/builder@sha256:<digest>   # buildah + aws cli
+  DEPLOYER_IMAGE: ${CI_TOOLS_REGISTRY}/deployer@sha256:<digest> # kubectl + aws cli + cosign v2
+
+unit_test:
+  stage: test
+  image: $NODE_IMAGE
+  script:
+    - npm ci --ignore-scripts # install scripts of dependencies do not run in CI
+    - npm test
+
+build:
+  stage: build
+  image: $BUILDER_IMAGE
+  extends: .aws_role # from security-gates.yml: GitLab ID token -> 1-hour AWS credentials
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # only main builds production images
+  tags: [build] # ephemeral runner; never holds deploy credentials
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: aws-prod-build
+  variables:
+    AWS_ROLE_ARN: arn:aws:iam::${PROD_AWS_ACCOUNT_ID}:role/gitlab-build-prod
+    # Daemonless build in an unprivileged container: no Docker daemon, no privileged runner.
+    BUILDAH_ISOLATION: chroot
+    STORAGE_DRIVER: vfs
+  script:
+    - aws ecr get-login-password | buildah login --username AWS --password-stdin "$ECR_REGISTRY"
+    - buildah build --pull --tag "$IMAGE:$IMAGE_TAG" .
+    - buildah push "$IMAGE:$IMAGE_TAG"
+
+image_scan:
+  extends: .container_scan # from security-gates.yml: SBOM + vulnerability gate on $IMAGE:$IMAGE_TAG
+  needs:
+    - job: build
+      artifacts: false # the image is looked up in ECR by its immutable tag
+
+deploy_prod:
+  stage: deploy
+  image: $DEPLOYER_IMAGE
+  extends: .aws_role
+  # Wait for both jobs but take no files or variables from them: the build job ran untrusted
+  # code (npm packages, Dockerfile steps), and variables from its artifacts would override
+  # this job's own.
+  needs:
+    - job: build
+      artifacts: false
+    - job: image_scan
+      artifacts: false
+  rules:
+    # Waits for the protected-environment approval by someone other than the person who
+    # triggered the pipeline.
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  environment:
+    name: production
+    deployment_tier: production
+  resource_group: production # one production deploy at a time
+  tags: [prod-deploy] # protected runner inside the prod VPC; runs nothing else
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: aws-prod-deploy
+  variables:
+    AWS_ROLE_ARN: arn:aws:iam::${PROD_AWS_ACCOUNT_ID}:role/gitlab-deploy-prod
+  script:
+    - REGISTRY="${PROD_AWS_ACCOUNT_ID}.dkr.ecr.eu-central-1.amazonaws.com"
+    - DIGEST=$(aws ecr describe-images --repository-name callback-handler --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)
+    - echo "$DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+    - REF="$REGISTRY/callback-handler@$DIGEST"
+    # The signature says: built from main, scanned, approved for production. Only this role can
+    # use the signing key. Signatures go to their own repository; Kyverno checks them before any
+    # pod starts.
+    - export COSIGN_REPOSITORY="$REGISTRY/image-signatures"
+    - aws ecr get-login-password | cosign login "$REGISTRY" --username AWS --password-stdin
+    - cosign sign --yes --tlog-upload=false --key awskms:///alias/image-signing-prod "$REF"
+    - aws eks update-kubeconfig --name platform-prod --region eu-central-1
+    - kubectl -n callbacks set image deployment/callback-handler app="$REF"
+    - kubectl -n callbacks rollout status deployment/callback-handler --timeout=5m || { kubectl -n callbacks rollout undo deployment/callback-handler; exit 1; }

@@ -1,0 +1,9 @@
+# A second, specific approver for the pipeline, for gate exceptions and for this file itself.
+# Enforced by "Require approval from code owners" on the protected main branch, with
+# "Prevent approval by author" on. Exception rules: SUBMISSION.md §2.5.
+
+/CODEOWNERS       @platform-team @security-team
+/.gitlab-ci.yml   @platform-team
+/Dockerfile       @platform-team
+/.trivyignore     @security-team @tech-leads
+/.gitleaksignore  @security-team @tech-leads

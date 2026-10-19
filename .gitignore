@@ -1,0 +1,4 @@
+# Local Terraform working files (running `terraform init` in remediation/terraform)
+.terraform/
+*.tfstate
+*.tfstate.*

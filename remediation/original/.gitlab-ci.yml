@@ -1,0 +1,17 @@
+# Brief Part 2C, as given. Kept for before/after comparison only.
+stages: [build, deploy]
+
+build:
+  image: docker:latest
+  services: [docker:dind]
+  script:
+    - docker login -u "$REGISTRY_USER" -p "$REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build -t "$IMAGE:latest" .
+    - docker push "$IMAGE:latest"
+
+deploy_prod:
+  stage: deploy
+  only: [main]
+  script:
+    - aws eks update-kubeconfig --name platform-prod
+    - kubectl set image deployment/callback-handler app="$IMAGE:latest"
